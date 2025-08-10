@@ -149,6 +149,8 @@
       if (!res.ok) throw new Error(`Gist 저장 실패: ${res.status} ${await res.text()}`);
       return await res.json();
     }
+
+    // ✅ 큰 파일 대응: truncated면 raw_url에서 재요청
     async function gistLoad({ token, gistId, filename }) {
       const headers = { "Accept": "application/vnd.github+json", "Authorization": `Bearer ${token}` };
       const res = await fetch(`https://api.github.com/gists/${gistId}`, { headers });
@@ -156,6 +158,12 @@
       const data = await res.json();
       const file = data.files && data.files[filename];
       if (!file) throw new Error("해당 파일명이 Gist에 없습니다.");
+
+      if (file.truncated && file.raw_url) {
+        const raw = await fetch(file.raw_url); // raw_url은 일반적으로 Authorization 불필요
+        if (!raw.ok) throw new Error(`RAW 불러오기 실패: ${raw.status} ${await raw.text()}`);
+        return await raw.text();
+      }
       return file.content;
     }
 
@@ -190,7 +198,7 @@
       useEffect(() => saveJSON(LS_KEYS.LOGS, logs), [logs]);
       useEffect(() => saveJSON(LS_KEYS.CONFIG, { ...config, mode }), [config, mode]);
 
-      // Auto sync
+      // Auto sync (저장 전용)
       const debouncedAutoSave = useMemo(() => debounce(async () => {
         if (config.autoSync && config.gistToken && config.filename) {
           try {
@@ -201,6 +209,24 @@
         }
       }, 1200), [config, words, stats, logs]);
       useEffect(() => { debouncedAutoSave(); }, [words, stats, logs, config.autoSync]);
+
+      // ✅ 앱 최초 1회: 설정이 갖춰져 있으면 자동 불러오기(병합)
+      useEffect(() => {
+        (async () => {
+          try {
+            if (config.gistToken && config.gistId && config.filename) {
+              const txt = await gistLoad({ token: config.gistToken, gistId: config.gistId, filename: config.filename });
+              const data = JSON.parse(txt);
+              setWords(prev => mergeWords(prev, data.words||[]));
+              setStats(prev => mergeStats(prev, data.stats||{}));
+              setLogs(prev => mergeLogs(prev, data.logs||[]));
+            }
+          } catch (e) {
+            console.warn("초기 자동 불러오기 실패:", e);
+          }
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, []);
 
       const [session, setSession] = useState({ active:false, queue:[], index:0, results:[] });
       const [showBack, setShowBack] = useState(false);
@@ -254,6 +280,7 @@
         }
       }, [finishSession]);
 
+      // ---- 단어 추가 상태 & 핸들러 (✅ 연결)
       const [jp, setJp] = useState("");
       const [ko, setKo] = useState("");
       const addWord = () => {
@@ -262,6 +289,7 @@
         setWords((prev) => [newWord, ...prev]);
         setJp(""); setKo("");
       };
+      const handleEnter = (e) => { if (e.key === "Enter") addWord(); };
 
       // ---- Cloud sync handlers (with MERGE) ----
       const saveToGist = async () => {
@@ -278,7 +306,6 @@
         try {
           const txt = await gistLoad({ token: config.gistToken, gistId: config.gistId, filename: config.filename });
           const data = JSON.parse(txt);
-          // --- MERGE instead of overwrite ---
           const mergedWords = mergeWords(words, data.words||[]);
           const mergedStats = mergeStats(stats, data.stats||{});
           const mergedLogs  = mergeLogs(logs, data.logs||[]);
@@ -325,10 +352,6 @@
                   <button onClick={()=>setMode("ko2ja")} className={`rounded-xl border px-3 py-2 ${mode==='ko2ja'?'bg-gray-900 text-white border-gray-900':'bg-white text-gray-800 border-gray-300'}`}>🇰🇷 → 🇯🇵 뜻 → 일본어</button>
                 </div>
 
-                {/* Start / Summary */}
-                {/* (content omitted here for brevity—same as previous version with cards & buttons) */}
-                {/* To keep message short, core logic above is what's changed (merge). */}
-
                 <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
                   <h2 className="text-base font-semibold">빠른 30개 세트</h2>
                   <p className="text-sm text-gray-600 mt-1">모르는 단어가 더 자주, 아는 단어도 가끔 등장합니다.</p>
@@ -354,14 +377,28 @@
                 <div className="rounded-2xl bg-white border border-gray-200 p-4 shadow-sm">
                   <h2 className="text-base font-semibold">단어 추가</h2>
                   <div className="mt-3 grid grid-cols-1 gap-2">
-                    <input id="jp" className="w-full rounded-xl border border-gray-300 px-3 py-3" placeholder="일본어 (例: 食べる)" />
-                    <input id="ko" className="w-full rounded-xl border border-gray-300 px-3 py-3" placeholder="한글 뜻 (예: 먹다)" />
+                    <input
+                      id="jp"
+                      className="w-full rounded-xl border border-gray-300 px-3 py-3"
+                      placeholder="일본어 (例: 食べる)"
+                      value={jp}
+                      onChange={(e)=>setJp(e.target.value)}
+                      onKeyDown={handleEnter}
+                    />
+                    <input
+                      id="ko"
+                      className="w-full rounded-xl border border-gray-300 px-3 py-3"
+                      placeholder="한글 뜻 (예: 먹다)"
+                      value={ko}
+                      onChange={(e)=>setKo(e.target.value)}
+                      onKeyDown={handleEnter}
+                    />
                     <div className="flex items-center gap-2">
-                      <button className="flex-1 rounded-xl bg-gray-900 text-white py-3 font-semibold" onclick="">
+                      <button className="flex-1 rounded-xl bg-gray-900 text-white py-3 font-semibold" onClick={addWord}>
                         추가
                       </button>
                     </div>
-                    <div className="text-xs text-gray-500">※ 이 섹션은 이전 버전과 동일합니다. (코어 변경은 병합 로직)</div>
+                    <div className="text-xs text-gray-500">※ 입력 후 Enter를 눌러도 추가됩니다.</div>
                   </div>
                 </div>
               </section>
@@ -411,7 +448,7 @@
                     </label>
                     <div className="flex items-center gap-2 mt-1">
                       <input id="autosync" type="checkbox" checked={!!config.autoSync} onChange={e=>setConfig(prev=>({...prev, autoSync:e.target.checked}))} />
-                      <label htmlFor="autosync" className="text-gray-700">자동 동기화</label>
+                      <label htmlFor="autosync" className="text-gray-700">자동 동기화(저장)</label>
                     </div>
                   </div>
                   <div className="mt-3 flex gap-2">
