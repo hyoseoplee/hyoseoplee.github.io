@@ -13,21 +13,29 @@
   <style>
     body { -webkit-tap-highlight-color: transparent; }
     .icon-btn { line-height: 1; }
+    /* 슬라이드 애니메이션 등 */
+    .fade-in { animation: fadeIn 0.3s ease-in-out; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
   </style>
 </head>
 <body class="bg-gray-50">
   <div id="root"></div>
 
   <script type="text/babel" data-presets="env,react">
-    const { useEffect, useMemo, useRef, useState } = React;
+    const { useEffect, useMemo, useRef, useState, useCallback } = React;
 
+    // --- Constants & Keys ---
+    // v4로 버전 업: 멀티 덱 지원을 위해 키 구조 변경
     const LS_KEYS = {
-      WORDS: "vocab_words_v3",
-      STATS: "vocab_stats_v3",
-      LOGS:  "vocab_logs_v1",
-      CONFIG: "vocab_config_v2", // includes mode
+      DECKS: "vocab_decks_v1", // [{ id, name, lang, createdAt }]
+      CONFIG: "vocab_config_v2", 
+      // 아래는 suffix로 deckID가 붙음 (예: vocab_words_v4_deck1)
+      WORDS_PREFIX: "vocab_words_v4_",
+      STATS_PREFIX: "vocab_stats_v4_",
+      LOGS_PREFIX:  "vocab_logs_v4_",
     };
 
+    // --- Utils ---
     function uid() {
       return Math.random().toString(36).slice(2) + Date.now().toString(36);
     }
@@ -42,8 +50,60 @@
     function saveJSON(key, value) {
       localStorage.setItem(key, JSON.stringify(value));
     }
+    
+    // 이전 버전(v3) 데이터 마이그레이션 (단일 일본어 덱으로 변환)
+    function checkMigration() {
+      const oldWords = localStorage.getItem("vocab_words_v3");
+      const hasDecks = localStorage.getItem(LS_KEYS.DECKS);
+      
+      if (oldWords && !hasDecks) {
+        // 기존 데이터가 있는데 덱 정보가 없으면 마이그레이션 수행
+        const defaultDeckId = uid();
+        const defaultDeck = { id: defaultDeckId, name: "기본 단어장 (일본어)", lang: "ja", createdAt: Date.now() };
+        
+        // Words: jp/ko -> term/def 변환
+        let words = [];
+        try { words = JSON.parse(oldWords); } catch {}
+        words = words.map(w => ({
+          ...w,
+          term: w.jp || w.term, // jp를 term으로 이동
+          def: w.ko || w.def,   // ko를 def로 이동
+          jp: undefined, ko: undefined // 기존 키 삭제
+        }));
 
-    // Simple debounce
+        // Stats & Logs
+        const stats = loadJSON("vocab_stats_v3", { sessions:0, reviews:0, correct:0, incorrect:0, history:[], perMode: { term2def: { reviews:0, correct:0 }, def2term: { reviews:0, correct:0 } } });
+        // 기존 perMode ja2ko -> term2def 매핑
+        if(stats.perMode?.ja2ko) {
+           stats.perMode.term2def = stats.perMode.ja2ko;
+           stats.perMode.def2term = stats.perMode.ko2ja;
+           delete stats.perMode.ja2ko;
+           delete stats.perMode.ko2ja;
+        }
+
+        const logs = loadJSON("vocab_logs_v1", []);
+        // Logs 아이템 매핑
+        const newLogs = logs.map(l => ({
+          ...l,
+          items: l.items ? l.items.map(i => ({...i, term: i.jp||i.term, def: i.ko||i.def, jp: undefined, ko: undefined})) : []
+        }));
+
+        // Save New Format
+        saveJSON(LS_KEYS.DECKS, [defaultDeck]);
+        saveJSON(LS_KEYS.WORDS_PREFIX + defaultDeckId, words);
+        saveJSON(LS_KEYS.STATS_PREFIX + defaultDeckId, stats);
+        saveJSON(LS_KEYS.LOGS_PREFIX + defaultDeckId, newLogs);
+        
+        // Clean old keys (Optional, but keeping simple for safety)
+        localStorage.removeItem("vocab_words_v3");
+        localStorage.removeItem("vocab_stats_v3");
+        localStorage.removeItem("vocab_logs_v1");
+        
+        return defaultDeckId;
+      }
+      return null;
+    }
+
     function debounce(fn, wait=800) {
       let t;
       return (...args) => {
@@ -52,6 +112,7 @@
       };
     }
 
+    // --- Logic: Weighting & Sampling ---
     function wordWeight(w) {
       if (!w.timesSeen) return 6;
       const knownRate = (w.timesKnown || 0) / (w.timesSeen || 1);
@@ -87,7 +148,7 @@
       return result.slice(0, k);
     }
 
-    // ---- Cloud sync via GitHub Gist (optional) ----
+    // --- Gist Sync ---
     async function gistCreateOrUpdate({ token, gistId, filename, content }) {
       const headers = {
         "Content-Type": "application/json",
@@ -98,101 +159,129 @@
       const endpoint = gistId ? `https://api.github.com/gists/${gistId}` : "https://api.github.com/gists";
       const method = gistId ? "PATCH" : "POST";
       if (!gistId) {
-        body.description = "vocab-mobile data (words, stats, logs)";
+        body.description = "vocab-mobile backup (all decks)";
         body.public = false;
       }
       const res = await fetch(endpoint, { method, headers, body: JSON.stringify(body) });
       if (!res.ok) {
         const txt = await res.text();
-        throw new Error(`Gist 저장 실패: ${res.status} ${txt}`);
+        throw new Error(`Gist Error: ${res.status} ${txt}`);
       }
       return await res.json();
     }
     async function gistLoad({ token, gistId, filename }) {
-      const headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": `Bearer ${token}`,
-      };
+      const headers = { "Accept": "application/vnd.github+json", "Authorization": `Bearer ${token}` };
       const res = await fetch(`https://api.github.com/gists/${gistId}`, { headers });
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(`Gist 불러오기 실패: ${res.status} ${txt}`);
-      }
+      if (!res.ok) throw new Error(`Load Error: ${res.status}`);
       const data = await res.json();
       const file = data.files && data.files[filename];
-      if (!file) throw new Error("해당 파일명을 가진 항목이 Gist에 없습니다.");
+      if (!file) throw new Error("File not found in Gist");
       return file.content;
     }
 
-    // ---- TTS (Japanese) ----
-    function speakJa(text) {
+    // --- TTS ---
+    function speak(text, lang) {
+      if (!text) return;
       try {
-        const u = new SpeechSynthesisUtterance(text);
-        u.lang = "ja-JP";
-        const voices = window.speechSynthesis.getVoices();
-        const ja = voices.find(v => v.lang && v.lang.toLowerCase().startsWith("ja"));
-        if (ja) u.voice = ja;
         window.speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        // Lang mapping
+        let locale = "en-US";
+        if (lang === "ja") locale = "ja-JP";
+        if (lang === "en") locale = "en-US";
+        
+        u.lang = locale;
+        const voices = window.speechSynthesis.getVoices();
+        const v = voices.find(voice => voice.lang && voice.lang.replace('_','-') === locale);
+        if (v) u.voice = v;
+        
+        u.rate = 0.9; 
         window.speechSynthesis.speak(u);
       } catch(e) {
-        alert("이 브라우저에서 음성 합성이 지원되지 않습니다.");
+        console.error("TTS Error", e);
       }
     }
 
+    // --- Components ---
     function App() {
-      const [tab, setTab] = useState("study");
-      const [mode, setMode] = useState(loadJSON(LS_KEYS.CONFIG, {}).mode || "ja2ko"); // ja2ko or ko2ja
-      const [words, setWords] = useState(loadJSON(LS_KEYS.WORDS, []));
-      const [stats, setStats] = useState(loadJSON(LS_KEYS.STATS, {
-        sessions:0, reviews:0, correct:0, incorrect:0, history:[],
-        perMode: { ja2ko: { reviews:0, correct:0 }, ko2ja: { reviews:0, correct:0 } },
-      }));
-      const [logs, setLogs] = useState(loadJSON(LS_KEYS.LOGS, [])); // [{id, ts, mode, total, correct, items:[{id,jp,ko,correct}]}]
-      const [config, setConfig] = useState(() => {
-        const prev = loadJSON(LS_KEYS.CONFIG, {
-          gistToken: "", gistId: "", autoSync: false, filename: "vocab_data.json", mode: "ja2ko"
-        });
-        return { ...prev, mode: prev.mode || "ja2ko" };
+      // 1. Initialize Decks & Active Deck
+      const [decks, setDecks] = useState(() => {
+        const migratedId = checkMigration(); // Run migration check once
+        const loaded = loadJSON(LS_KEYS.DECKS, []);
+        if (loaded.length === 0) {
+          const newDeck = { id: uid(), name: "기본 단어장 (일본어)", lang: "ja", createdAt: Date.now() };
+          saveJSON(LS_KEYS.DECKS, [newDeck]);
+          return [newDeck];
+        }
+        return loaded;
       });
 
-      useEffect(() => saveJSON(LS_KEYS.WORDS, words), [words]);
-      useEffect(() => saveJSON(LS_KEYS.STATS, stats), [stats]);
-      useEffect(() => saveJSON(LS_KEYS.LOGS, logs), [logs]);
-      useEffect(() => { saveJSON(LS_KEYS.CONFIG, config); }, [config]);
-      useEffect(() => { setConfig(prev => ({ ...prev, mode })); }, [mode]);
+      const [activeDeckId, setActiveDeckId] = useState(() => {
+        return decks[0]?.id; 
+      });
 
-      // Auto sync debounce
-      const debouncedAutoSave = useMemo(() => debounce(async () => {
-        if (config.autoSync && config.gistToken && config.filename) {
-          try {
-            const payload = JSON.stringify({ words, stats, logs }, null, 2);
-            const resp = await gistCreateOrUpdate({
-              token: config.gistToken,
-              gistId: config.gistId || undefined,
-              filename: config.filename,
-              content: payload,
-            });
-            if (!config.gistId && resp.id) {
-              setConfig(prev => ({ ...prev, gistId: resp.id }));
-            }
-          } catch (err) {
-            console.error(err);
-          }
-        }
-      }, 1200), [config, words, stats, logs]);
+      const activeDeck = useMemo(() => decks.find(d => d.id === activeDeckId) || decks[0], [decks, activeDeckId]);
 
+      // 2. Load Data for Active Deck
+      const [words, setWords] = useState([]);
+      const [stats, setStats] = useState({ sessions:0, reviews:0, correct:0, incorrect:0, history:[], perMode: { term2def: { reviews:0, correct:0 }, def2term: { reviews:0, correct:0 } } });
+      const [logs, setLogs] = useState([]);
+
+      // Load data when deck changes
       useEffect(() => {
-        debouncedAutoSave();
-      }, [words, stats, logs, config.autoSync]);
+        if (!activeDeckId) return;
+        setWords(loadJSON(LS_KEYS.WORDS_PREFIX + activeDeckId, []));
+        setStats(loadJSON(LS_KEYS.STATS_PREFIX + activeDeckId, {
+          sessions:0, reviews:0, correct:0, incorrect:0, history:[], 
+          perMode: { term2def: { reviews:0, correct:0 }, def2term: { reviews:0, correct:0 } }
+        }));
+        setLogs(loadJSON(LS_KEYS.LOGS_PREFIX + activeDeckId, []));
+      }, [activeDeckId]);
 
+      // Save data when state changes
+      useEffect(() => { if(activeDeckId) saveJSON(LS_KEYS.WORDS_PREFIX + activeDeckId, words); }, [words, activeDeckId]);
+      useEffect(() => { if(activeDeckId) saveJSON(LS_KEYS.STATS_PREFIX + activeDeckId, stats); }, [stats, activeDeckId]);
+      useEffect(() => { if(activeDeckId) saveJSON(LS_KEYS.LOGS_PREFIX + activeDeckId, logs); }, [logs, activeDeckId]);
+      useEffect(() => { saveJSON(LS_KEYS.DECKS, decks); }, [decks]);
+
+      // 3. Global Config
+      const [tab, setTab] = useState("study");
+      const [mode, setMode] = useState(loadJSON(LS_KEYS.CONFIG, {}).mode || "term2def"); // term2def (Foreign->Native) or def2term (Native->Foreign)
+      const [config, setConfig] = useState(() => loadJSON(LS_KEYS.CONFIG, { gistToken: "", gistId: "", autoSync: false, filename: "vocab_v4_backup.json" }));
+
+      useEffect(() => { saveJSON(LS_KEYS.CONFIG, { ...config, mode }); }, [config, mode]);
+
+      // 4. Session State
       const [session, setSession] = useState({ active:false, queue:[], index:0, results:[] });
       const [showBack, setShowBack] = useState(false);
 
+      // --- Actions ---
+      
+      // Deck Management
+      const createDeck = (name, lang) => {
+        const newDeck = { id: uid(), name: name.trim(), lang, createdAt: Date.now() };
+        setDecks(prev => [...prev, newDeck]);
+        setActiveDeckId(newDeck.id);
+        alert(`'${newDeck.name}' 단어장이 생성되었습니다.`);
+      };
+
+      const deleteDeck = (id) => {
+        if (decks.length <= 1) return alert("최소 하나의 단어장은 있어야 합니다.");
+        if (!confirm("정말 이 단어장을 삭제하시겠습니까? 포함된 모든 단어와 통계가 삭제됩니다.")) return;
+        
+        const nextDeck = decks.find(d => d.id !== id);
+        setDecks(prev => prev.filter(d => d.id !== id));
+        setActiveDeckId(nextDeck.id);
+        
+        // Cleanup storage
+        localStorage.removeItem(LS_KEYS.WORDS_PREFIX + id);
+        localStorage.removeItem(LS_KEYS.STATS_PREFIX + id);
+        localStorage.removeItem(LS_KEYS.LOGS_PREFIX + id);
+      };
+
+      // Study Logic
       const startSession = () => {
-        if (words.length === 0) {
-          alert("먼저 단어를 추가해 주세요.");
-          setTab("words"); return;
-        }
+        if (words.length === 0) { alert("먼저 단어를 추가해 주세요."); setTab("words"); return; }
         const weighted = words.map((w) => ({ item: w, weight: wordWeight(w) }));
         const queue = weightedSample(weighted, 30);
         setSession({ active: true, queue, index: 0, results: [] });
@@ -212,7 +301,11 @@
           upd.lastSeen = Date.now();
           return upd;
         }));
-        setSession((s) => ({ ...s, results: [...s.results, { id: current.id, correct: isKnown, jp: current.jp, ko: current.ko }], index: Math.min(s.index + 1, s.queue.length) }));
+        setSession((s) => ({ 
+          ...s, 
+          results: [...s.results, { id: current.id, correct: isKnown, term: current.term, def: current.def }], 
+          index: Math.min(s.index + 1, s.queue.length) 
+        }));
         setShowBack(false);
       };
 
@@ -222,13 +315,12 @@
         if (finishSession) {
           const total = session.results.length;
           const correct = session.results.filter(r => r.correct).length;
-          const incorrect = total - correct;
           setStats((prev) => ({
             ...prev,
             sessions: prev.sessions + 1,
             reviews: prev.reviews + total,
             correct: prev.correct + correct,
-            incorrect: prev.incorrect + incorrect,
+            incorrect: prev.incorrect + (total - correct),
             perMode: {
               ...prev.perMode,
               [mode]: {
@@ -238,12 +330,17 @@
             },
             history: [...prev.history.slice(-49), { ts: Date.now(), total, correct, mode }],
           }));
-          setLogs((prev) => [...prev, { id: uid(), ts: Date.now(), mode, total, correct, items: session.results.map(r=>({ id: r.id, jp: r.jp, ko: r.ko, correct: r.correct })) }]);
+          setLogs((prev) => [...prev, { 
+            id: uid(), ts: Date.now(), mode, total, correct, 
+            items: session.results.map(r=>({ id: r.id, term: r.term, def: r.def, correct: r.correct })) 
+          }]);
         }
       }, [finishSession]);
 
-      const missedWordIds = useMemo(() => new Set(session.results.filter(r => !r.correct).map(r => r.id)), [session.results]);
-      const missedWords = useMemo(() => words.filter(w => missedWordIds.has(w.id)), [words, missedWordIds]);
+      const missedWords = useMemo(() => {
+         const ids = new Set(session.results.filter(r => !r.correct).map(r => r.id));
+         return words.filter(w => ids.has(w.id));
+      }, [session.results, words]);
 
       const restartWithMissed = () => {
         const candidates = missedWords.length ? missedWords : words;
@@ -254,420 +351,412 @@
         setTab("study");
       };
 
-      const [jp, setJp] = useState("");
-      const [ko, setKo] = useState("");
-
+      // Word Input
+      const [inputTerm, setInputTerm] = useState("");
+      const [inputDef, setInputDef] = useState("");
+      
       const addWord = () => {
-        if (!jp.trim() || !ko.trim()) return;
-        const newWord = { id: uid(), jp: jp.trim(), ko: ko.trim(), addedAt: Date.now(), timesSeen:0, timesKnown:0, timesUnknown:0, lastSeen:null, streakKnown:0 };
-        setWords((prev) => [newWord, ...prev]);
-        setJp(""); setKo("");
+        if (!inputTerm.trim() || !inputDef.trim()) return;
+        const newWord = { id: uid(), term: inputTerm.trim(), def: inputDef.trim(), addedAt: Date.now(), timesSeen:0, timesKnown:0, timesUnknown:0 };
+        setWords(p => [newWord, ...p]);
+        setInputTerm(""); setInputDef("");
       };
 
-      const bulkRef = React.useRef(null);
+      const bulkRef = useRef(null);
       const addBulk = () => {
-        const textarea = bulkRef.current;
-        if (!textarea) return;
-        const lines = textarea.value.split(/\n+/).map(l => l.trim()).filter(Boolean);
-        if (lines.length === 0) return;
+        if (!bulkRef.current) return;
+        const lines = bulkRef.current.value.split(/\n+/).map(l => l.trim()).filter(Boolean);
         const newItems = lines.map((line) => {
-          const [j, k] = line.split(/[,\t|]/);
-          return { id: uid(), jp: (j||"").trim(), ko: (k||"").trim(), addedAt: Date.now(), timesSeen:0, timesKnown:0, timesUnknown:0, lastSeen:null, streakKnown:0 };
-        }).filter(w => w.jp && w.ko);
-        if (newItems.length === 0) return;
-        setWords((prev) => [...newItems, ...prev]);
-        textarea.value = "";
+          const [t, d] = line.split(/[,\t|]/);
+          return { id: uid(), term: (t||"").trim(), def: (d||"").trim(), addedAt: Date.now(), timesSeen:0, timesKnown:0, timesUnknown:0 };
+        }).filter(w => w.term && w.def);
+        if (newItems.length) setWords(p => [...newItems, ...p]);
+        bulkRef.current.value = "";
       };
 
-      const removeWord = (id) => setWords((prev) => prev.filter((w) => w.id !== id));
-
-      const resetAll = () => {
-        if (!confirm("모든 단어, 통계, 로그를 초기화하시겠습니까?")) return;
-        setWords([]);
-        setStats({ sessions:0, reviews:0, correct:0, incorrect:0, history:[], perMode:{ ja2ko:{reviews:0,correct:0}, ko2ja:{reviews:0,correct:0} } });
-        setLogs([]);
-        setSession({ active: false, queue: [], index: 0, results: [] });
-        setShowBack(false);
+      // --- Sync Handlers (All Decks) ---
+      const gatherAllData = () => {
+        const dump = { version: 4, decks: decks, data: {} };
+        decks.forEach(d => {
+          dump.data[d.id] = {
+            words: d.id === activeDeckId ? words : loadJSON(LS_KEYS.WORDS_PREFIX + d.id, []),
+            stats: d.id === activeDeckId ? stats : loadJSON(LS_KEYS.STATS_PREFIX + d.id, {}),
+            logs: d.id === activeDeckId ? logs : loadJSON(LS_KEYS.LOGS_PREFIX + d.id, []),
+          };
+        });
+        return dump;
       };
 
-      const accuracyTotal = stats.reviews ? Math.round((stats.correct / stats.reviews) * 100) : 0;
-      const accuracyJa2Ko = stats.perMode.ja2ko.reviews ? Math.round((stats.perMode.ja2ko.correct / stats.perMode.ja2ko.reviews)*100) : 0;
-      const accuracyKo2Ja = stats.perMode.ko2ja.reviews ? Math.round((stats.perMode.ko2ja.correct / stats.perMode.ko2ja.reviews)*100) : 0;
-      const knownCount = words.filter(w => w.timesSeen > 0 && (w.timesKnown / w.timesSeen) >= 0.8).length;
-      const weakCount = words.filter(w => w.timesSeen > 0 && (w.timesKnown / w.timesSeen) < 0.5).length;
-
-      // ---- Cloud sync handlers ----
       const saveToGist = async () => {
-        if (!config.gistToken) return alert("토큰을 입력해 주세요.");
+        if (!config.gistToken) return alert("설정에서 토큰을 입력해주세요.");
         try {
-          const payload = JSON.stringify({ words, stats, logs }, null, 2);
+          const payload = JSON.stringify(gatherAllData(), null, 2);
           const resp = await gistCreateOrUpdate({
-            token: config.gistToken,
-            gistId: config.gistId || undefined,
-            filename: config.filename,
-            content: payload,
+            token: config.gistToken, gistId: config.gistId || undefined, filename: config.filename, content: payload,
           });
-          if (!config.gistId && resp.id) {
-            setConfig(prev => ({ ...prev, gistId: resp.id }));
-          }
-          alert("Gist에 저장했습니다.");
-        } catch (e) {
-          alert(e.message);
-        }
+          if (!config.gistId && resp.id) setConfig(p => ({ ...p, gistId: resp.id }));
+          alert("모든 단어장을 Gist에 저장(백업)했습니다.");
+        } catch(e) { alert(e.message); }
       };
+
       const loadFromGist = async () => {
-        if (!config.gistToken || !config.gistId) return alert("토큰과 Gist ID를 입력해 주세요.");
+        if (!config.gistToken || !config.gistId) return alert("토큰과 ID가 필요합니다.");
         try {
-          const txt = await gistLoad({
-            token: config.gistToken,
-            gistId: config.gistId,
-            filename: config.filename,
+          const txt = await gistLoad({ token: config.gistToken, gistId: config.gistId, filename: config.filename });
+          const json = JSON.parse(txt);
+          
+          if (!json.decks || !Array.isArray(json.decks)) throw new Error("데이터 형식이 올바르지 않습니다.");
+          if (!confirm("현재 기기의 모든 데이터를 덮어쓰고 복원하시겠습니까?")) return;
+
+          // Restore Decks
+          saveJSON(LS_KEYS.DECKS, json.decks);
+          setDecks(json.decks);
+          
+          // Restore Data per deck
+          Object.keys(json.data).forEach(deckId => {
+            const d = json.data[deckId];
+            saveJSON(LS_KEYS.WORDS_PREFIX + deckId, d.words || []);
+            saveJSON(LS_KEYS.STATS_PREFIX + deckId, d.stats || {});
+            saveJSON(LS_KEYS.LOGS_PREFIX + deckId, d.logs || []);
           });
-          const data = JSON.parse(txt);
-          if (Array.isArray(data.words)) setWords(data.words);
-          if (data.stats) setStats(data.stats);
-          if (Array.isArray(data.logs)) setLogs(data.logs);
-          alert("Gist에서 불러왔습니다.");
-        } catch (e) {
-          alert(e.message);
-        }
+
+          // Set active deck to first one
+          if (json.decks.length > 0) setActiveDeckId(json.decks[0].id);
+          alert("복원이 완료되었습니다.");
+        } catch(e) { alert("복원 실패: " + e.message); }
       };
-      const createNewGist = async () => {
-        if (!config.gistToken) return alert("토큰을 입력해 주세요.");
-        try {
-          const payload = JSON.stringify({ words, stats, logs }, null, 2);
-          const resp = await gistCreateOrUpdate({
-            token: config.gistToken,
-            gistId: undefined,
-            filename: config.filename,
-            content: payload,
-          });
-          setConfig(prev => ({ ...prev, gistId: resp.id }));
-          alert("새 Gist를 생성했습니다.");
-        } catch (e) {
-          alert(e.message);
+
+      // Auto Sync (Debounced)
+      const debouncedSync = useMemo(() => debounce(async () => {
+        if (config.autoSync && config.gistToken && config.filename) {
+          // Note: In a real app, passing 'words' etc directly to debounce might be stale, 
+          // but here we regenerate the dumper. Ideally use a ref for latest data.
+          // For simplicity, we just save what is in LS mostly.
+          try {
+            const payload = JSON.stringify(gatherAllData(), null, 2);
+            await gistCreateOrUpdate({ token: config.gistToken, gistId: config.gistId, filename: config.filename, content: payload });
+            console.log("Auto synced");
+          } catch(e) { console.error(e); }
         }
-      };
+      }, 2000), [config, words, stats, logs, decks]); // Dep list ensures it triggers on change
+
+      useEffect(() => { debouncedSync(); }, [words, stats, logs, config.autoSync]);
+
+      // --- UI Helpers ---
+      const accuracyTotal = stats.reviews ? Math.round((stats.correct / stats.reviews) * 100) : 0;
+      const getLangLabel = (l) => l === 'ja' ? '🇯🇵 일본어' : '🇺🇸 영어';
+      const termLabel = activeDeck.lang === 'ja' ? '일본어' : '영어';
 
       return (
-        <div className="min-h-screen w-full bg-gray-50 text-gray-900">
-          <header className="sticky top-0 z-10 bg-white border-b border-gray-200">
-            <div className="mx-auto max-w-md px-4 py-3 flex items-center justify-between">
-              <h1 className="text-lg font-bold">단어카드</h1>
-              <nav className="flex gap-2 text-sm">
-                <button onClick={() => setTab("study")} className={`px-3 py-1 rounded-full border ${tab==='study'?'bg-gray-900 text-white border-gray-900':'bg-white text-gray-700 border-gray-300'}`}>학습</button>
-                <button onClick={() => setTab("words")} className={`px-3 py-1 rounded-full border ${tab==='words'?'bg-gray-900 text-white border-gray-900':'bg-white text-gray-700 border-gray-300'}`}>단어</button>
-                <button onClick={() => setTab("stats")} className={`px-3 py-1 rounded-full border ${tab==='stats'?'bg-gray-900 text-white border-gray-900':'bg-white text-gray-700 border-gray-300'}`}>통계</button>
-                <button onClick={() => setTab("settings")} className={`px-3 py-1 rounded-full border ${tab==='settings'?'bg-gray-900 text-white border-gray-900':'bg-white text-gray-700 border-gray-300'}`}>설정</button>
+        <div className="min-h-screen w-full bg-gray-50 text-gray-900 pb-20">
+          
+          {/* Header */}
+          <header className="sticky top-0 z-20 bg-white/90 backdrop-blur border-b border-gray-200">
+            <div className="mx-auto max-w-md px-4 h-14 flex items-center justify-between">
+              {/* Deck Selector */}
+              <div className="relative group">
+                <button className="flex items-center gap-1 font-bold text-lg max-w-[200px] truncate">
+                  {activeDeck.name} 
+                  <span className="text-xs text-gray-500 font-normal ml-1">({activeDeck.lang==='ja'?'🇯🇵':'🇺🇸'})</span>
+                  <span className="text-[10px] text-gray-400">▼</span>
+                </button>
+                {/* Dropdown */}
+                <div className="absolute top-full left-0 mt-2 w-56 bg-white border border-gray-200 rounded-xl shadow-xl p-1 hidden group-hover:block hover:block">
+                  <div className="text-xs font-medium text-gray-400 px-3 py-2">단어장 선택</div>
+                  {decks.map(d => (
+                    <button key={d.id} onClick={()=>setActiveDeckId(d.id)} className={`w-full text-left px-3 py-2 rounded-lg text-sm ${activeDeckId===d.id ? 'bg-gray-100 font-bold':'hover:bg-gray-50'}`}>
+                      {d.name} <span className="text-gray-400 text-xs ml-1">{d.lang.toUpperCase()}</span>
+                    </button>
+                  ))}
+                  <div className="border-t border-gray-100 my-1"></div>
+                  <button onClick={()=>setTab("settings")} className="w-full text-left px-3 py-2 rounded-lg text-sm text-blue-600 hover:bg-blue-50">+ 단어장 관리</button>
+                </div>
+              </div>
+
+              <nav className="flex gap-1">
+                {["study","words","stats","settings"].map(t => (
+                  <button key={t} onClick={()=>setTab(t)} className={`p-2 rounded-full ${tab===t?'bg-gray-100 text-black':'text-gray-400'}`}>
+                    {t==='study' && <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" /></svg>}
+                    {t==='words' && <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>}
+                    {t==='stats' && <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>}
+                    {t==='settings' && <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>}
+                  </button>
+                ))}
               </nav>
             </div>
           </header>
 
-          <main className="mx-auto max-w-md px-4 pb-28 pt-4">
+          <main className="mx-auto max-w-md px-4 pt-4">
+            
+            {/* --- TAB: STUDY --- */}
             {tab === "study" && (
-              <section>
+              <section className="fade-in">
                 {/* Mode Switch */}
-                <div className="mb-3 grid grid-cols-2 gap-2">
-                  <button onClick={()=>setMode("ja2ko")} className={`rounded-xl border px-3 py-2 ${mode==='ja2ko'?'bg-gray-900 text-white border-gray-900':'bg-white text-gray-800 border-gray-300'}`}>🇯🇵 → 🇰🇷 일본어 → 뜻</button>
-                  <button onClick={()=>setMode("ko2ja")} className={`rounded-xl border px-3 py-2 ${mode==='ko2ja'?'bg-gray-900 text-white border-gray-900':'bg-white text-gray-800 border-gray-300'}`}>🇰🇷 → 🇯🇵 뜻 → 일본어</button>
+                <div className="mb-4 grid grid-cols-2 gap-2 bg-gray-200 p-1 rounded-xl">
+                  <button onClick={()=>setMode("term2def")} className={`rounded-lg py-2 text-sm font-medium transition-all ${mode==='term2def'?'bg-white text-black shadow-sm':'text-gray-500 hover:text-gray-700'}`}>
+                    {activeDeck.lang==='ja'?'🇯🇵 → 🇰🇷':'🇺🇸 → 🇰🇷'} {termLabel} 보고 뜻
+                  </button>
+                  <button onClick={()=>setMode("def2term")} className={`rounded-lg py-2 text-sm font-medium transition-all ${mode==='def2term'?'bg-white text-black shadow-sm':'text-gray-500 hover:text-gray-700'}`}>
+                    🇰🇷 → {activeDeck.lang==='ja'?'🇯🇵':'🇺🇸'} 뜻 보고 {termLabel}
+                  </button>
                 </div>
 
-                {!session.active && (
+                {!session.active ? (
                   <div className="space-y-4">
-                    <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-                      <h2 className="text-base font-semibold">빠른 30개 세트</h2>
-                      <p className="text-sm text-gray-600 mt-1">모르는 단어가 더 자주, 아는 단어도 가끔 등장합니다.</p>
-                      <div className="mt-3 flex gap-2">
-                        <button onClick={startSession} className="flex-1 rounded-xl bg-gray-900 text-white py-3 font-semibold">세트 시작</button>
-                        <button onClick={() => setTab("words")} className="rounded-xl bg-white text-gray-900 py-3 px-4 border border-gray-300">단어 추가</button>
-                      </div>
+                    <div className="rounded-3xl bg-white p-6 shadow-sm border border-gray-100 text-center">
+                      <div className="text-4xl mb-2">🎓</div>
+                      <h2 className="text-xl font-bold text-gray-900">오늘의 학습</h2>
+                      <p className="text-sm text-gray-500 mt-2 mb-6">현재 단어장: <b>{activeDeck.name}</b><br/>등록된 단어: {words.length}개</p>
+                      
+                      <button onClick={startSession} className="w-full rounded-2xl bg-gray-900 text-white py-4 font-bold text-lg shadow-lg shadow-gray-200 active:scale-95 transition-transform">
+                        30개 학습 시작
+                      </button>
                     </div>
 
                     {words.length === 0 && (
-                      <div className="rounded-2xl border border-dashed border-gray-300 bg-white p-4 text-sm text-gray-700">
-                        먼저 단어를 추가하세요. 예시 입력(한 줄에 "일본어,한글"):
-                        <pre className="mt-2 bg-gray-50 p-2 rounded">食べる,먹다{"\n"}美しい,아름답다{"\n"}速い,빠르다</pre>
+                      <div className="text-center p-8 text-gray-400 bg-white rounded-3xl border border-dashed border-gray-200">
+                        아직 단어가 없습니다.<br/>'단어' 탭에서 추가해주세요.
                       </div>
                     )}
-
-                    {words.length > 0 && (
-                      <div className="text-xs text-gray-600">등록 단어 {words.length}개 · 전체 정확도 {accuracyTotal}% · 🇯🇵→🇰🇷 {accuracyJa2Ko}% · 🇰🇷→🇯🇵 {accuracyKo2Ja}%</div>
-                    )}
                   </div>
-                )}
-
-                {session.active && !finishSession && current && (
-                  <div className="space-y-4">
-                    <div className="flex items-center justify-between text-sm text-gray-600">
-                      <span>진행 {session.index + 1} / {session.queue.length}</span>
-                      <button onClick={() => setSession({ active: false, queue: [], index: 0, results: [] })} className="underline">세트 중단</button>
+                ) : !finishSession ? (
+                  // Active Session
+                  <div className="space-y-6">
+                    <div className="flex items-center justify-between text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                      <span>Card {session.index + 1} / {session.queue.length}</span>
+                      <button onClick={() => setSession({ active: false, queue: [], index: 0, results: [] })} className="hover:text-red-500">Quit</button>
                     </div>
 
-                    <div className="rounded-3xl bg-white border border-gray-200 shadow-sm p-6 text-center select-none">
-                      {mode === "ja2ko" ? (
-                        <div className="text-2xl font-bold tracking-wide flex items-center justify-center gap-2">
-                          <span>{current.jp}</span>
-                          <button className="text-sm px-2 py-1 rounded-full border border-gray-300 bg-white icon-btn" title="발음 듣기" onClick={() => speakJa(current.jp)}>🔊</button>
-                        </div>
-                      ) : (
-                        <div className="text-2xl font-bold tracking-wide">{current.ko}</div>
-                      )}
-                      <div className="mt-6">
-                        {!showBack ? (
-                          <button onClick={() => setShowBack(true)} className="w-full rounded-xl border border-gray-300 bg-gray-50 py-3">정답 보기</button>
-                        ) : (
-                          <div className="text-lg text-gray-900 font-medium flex items-center justify-center gap-2">
-                            {mode === "ja2ko" ? current.ko : (<><span>{current.jp}</span><button className="text-sm px-2 py-1 rounded-full border border-gray-300 bg-white icon-btn" title="발음 듣기" onClick={() => speakJa(current.jp)}>🔊</button></>)}
+                    <div className="relative min-h-[300px] flex flex-col items-center justify-center rounded-3xl bg-white border border-gray-200 shadow-xl p-8 text-center transition-all">
+                       {/* Main Content */}
+                       {mode === "term2def" ? (
+                          <div className="flex flex-col items-center gap-4">
+                            <div className="text-4xl font-black text-gray-800 break-all">{current.term}</div>
+                            <button className="p-3 rounded-full bg-gray-50 text-gray-600 hover:bg-gray-100 active:bg-gray-200 transition-colors" onClick={(e)=>{ e.stopPropagation(); speak(current.term, activeDeck.lang); }}>
+                                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" /></svg>
+                            </button>
                           </div>
-                        )}
-                      </div>
+                       ) : (
+                          <div className="text-3xl font-bold text-gray-800 break-all">{current.def}</div>
+                       )}
+
+                       {/* Reveal Area */}
+                       <div className={`mt-8 w-full transition-all duration-300 ${showBack ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4 pointer-events-none'}`}>
+                         <div className="pt-8 border-t border-gray-100">
+                           {mode === "term2def" ? (
+                             <div className="text-2xl text-gray-600 font-medium">{current.def}</div>
+                           ) : (
+                             <div className="flex flex-col items-center gap-2">
+                               <div className="text-3xl text-gray-800 font-bold">{current.term}</div>
+                               <button className="text-sm px-3 py-1 bg-gray-50 rounded-full text-gray-500" onClick={()=>speak(current.term, activeDeck.lang)}>🔊 발음 듣기</button>
+                             </div>
+                           )}
+                         </div>
+                       </div>
+
+                       {/* Show Answer Button Overlay */}
+                       {!showBack && (
+                         <div className="absolute inset-0 z-10 flex items-end pb-8 justify-center">
+                           <button onClick={() => setShowBack(true)} className="px-8 py-3 bg-gray-900 text-white font-semibold rounded-full shadow-lg hover:bg-black transition-colors">
+                             정답 확인
+                           </button>
+                         </div>
+                       )}
                     </div>
 
-                    <div className="grid grid-cols-2 gap-3">
-                      <button onClick={() => recordAnswer(false)} className="rounded-2xl bg-white border-2 border-red-400 py-3 font-semibold">몰랐음</button>
-                      <button onClick={() => recordAnswer(true)} className="rounded-2xl bg-white border-2 border-green-500 py-3 font-semibold">알았음</button>
-                    </div>
+                    {showBack && (
+                      <div className="grid grid-cols-2 gap-4 fade-in">
+                        <button onClick={() => recordAnswer(false)} className="rounded-2xl bg-red-50 border-2 border-red-100 text-red-600 py-4 font-bold text-lg active:scale-95 transition-transform">몰라요 😥</button>
+                        <button onClick={() => recordAnswer(true)} className="rounded-2xl bg-green-50 border-2 border-green-100 text-green-600 py-4 font-bold text-lg active:scale-95 transition-transform">알아요 😉</button>
+                      </div>
+                    )}
                   </div>
-                )}
-
-                {finishSession && (
-                  <div className="space-y-4">
-                    <div className="rounded-2xl bg-white border border-gray-200 p-5 shadow-sm">
-                      {(() => {
-                        const total = session.results.length;
-                        const correct = session.results.filter(r => r.correct).length;
-                        const rate = total ? Math.round((correct/total)*100) : 0;
-                        return (
-                          <>
-                            <h2 className="text-base font-semibold">세트 결과 ({mode === "ja2ko" ? "🇯🇵→🇰🇷" : "🇰🇷→🇯🇵"})</h2>
-                            <div className="mt-2 text-sm text-gray-700">정답률 <span className="font-bold text-gray-900">{rate}%</span> ({correct}/{total})</div>
-                          </>
-                        );
-                      })()}
-                      <div className="mt-3 flex gap-2">
-                        <button onClick={startSession} className="flex-1 rounded-xl bg-gray-900 text-white py-3 font-semibold">새 세트 시작</button>
-                        <button onClick={restartWithMissed} className="flex-1 rounded-xl bg-white border border-gray-300 py-3 font-semibold">모르는 단어만</button>
+                ) : (
+                  // Results
+                  <div className="space-y-6 fade-in">
+                    <div className="rounded-3xl bg-white border border-gray-200 p-8 text-center shadow-sm">
+                      <div className="text-sm text-gray-500 font-medium uppercase">Session Complete</div>
+                      <div className="text-5xl font-black text-gray-900 mt-2 mb-1">
+                        {Math.round((session.results.filter(r=>r.correct).length / session.results.length)*100)}%
+                      </div>
+                      <div className="text-gray-400 text-sm mb-6">정답률</div>
+                      
+                      <div className="flex gap-3">
+                        <button onClick={startSession} className="flex-1 bg-gray-900 text-white rounded-xl py-3 font-semibold">다시 하기</button>
+                        <button onClick={restartWithMissed} className="flex-1 bg-white border border-gray-300 text-gray-900 rounded-xl py-3 font-semibold">오답만 복습</button>
                       </div>
                     </div>
 
-                    <div className="rounded-2xl bg-white border border-gray-200 p-5 shadow-sm">
-                      <h3 className="text-sm font-semibold">이번 세트에서 모른 항목</h3>
-                      {Array.from(missedWords).length === 0 ? (
-                        <p className="mt-2 text-sm text-gray-600">모든 항목을 맞혔습니다. 훌륭합니다!</p>
-                      ) : (
-                        <ul className="mt-2 text-sm list-disc list-inside space-y-1">
+                    {missedWords.length > 0 && (
+                      <div className="bg-white rounded-3xl border border-gray-200 p-6">
+                        <h3 className="font-bold text-lg mb-4">틀린 단어 ({missedWords.length})</h3>
+                        <ul className="space-y-3">
                           {missedWords.map(w => (
-                            <li key={w.id}><span className="font-medium">{mode==="ja2ko"?w.jp:w.ko}</span> — {mode==="ja2ko"?w.ko:w.jp}</li>
+                            <li key={w.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-xl">
+                              <div>
+                                <div className="font-bold">{w.term}</div>
+                                <div className="text-sm text-gray-500">{w.def}</div>
+                              </div>
+                              <button onClick={()=>speak(w.term, activeDeck.lang)} className="text-gray-400 p-2">🔊</button>
+                            </li>
                           ))}
                         </ul>
-                      )}
-                    </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </section>
             )}
 
+            {/* --- TAB: WORDS --- */}
             {tab === "words" && (
-              <section className="space-y-4">
-                <div className="rounded-2xl bg-white border border-gray-200 p-4 shadow-sm">
-                  <h2 className="text-base font-semibold">단어 추가</h2>
-                  <div className="mt-3 grid grid-cols-1 gap-2">
-                    <input value={jp} onChange={(e)=>setJp(e.target.value)} className="w-full rounded-xl border border-gray-300 px-3 py-3" placeholder="일본어 (例: 食べる)" />
-                    <input value={ko} onChange={(e)=>setKo(e.target.value)} className="w-full rounded-xl border border-gray-300 px-3 py-3" placeholder="한글 뜻 (예: 먹다)" />
-                    <div className="flex items-center gap-2">
-                      <button onClick={addWord} className="flex-1 rounded-xl bg-gray-900 text-white py-3 font-semibold">추가</button>
-                      {jp.trim() && (
-                        <button type="button" onClick={() => speakJa(jp.trim())} className="px-3 py-3 rounded-xl border border-gray-300 bg-white icon-btn" title="입력 단어 발음">🔊</button>
-                      )}
+              <section className="space-y-6 fade-in">
+                <div className="bg-white p-5 rounded-3xl border border-gray-200 shadow-sm">
+                  <h2 className="font-bold text-lg mb-3">단어 추가 ({activeDeck.name})</h2>
+                  <div className="space-y-3">
+                    <div>
+                       <label className="text-xs text-gray-400 font-semibold ml-1">{termLabel}</label>
+                       <div className="relative">
+                         <input value={inputTerm} onChange={e=>setInputTerm(e.target.value)} className="w-full bg-gray-50 rounded-xl px-4 py-3 border-none focus:ring-2 focus:ring-gray-900" placeholder="예: Apple" />
+                         {inputTerm && <button onClick={()=>speak(inputTerm, activeDeck.lang)} className="absolute right-3 top-3 text-gray-400">🔊</button>}
+                       </div>
                     </div>
+                    <div>
+                       <label className="text-xs text-gray-400 font-semibold ml-1">뜻 (한국어)</label>
+                       <input value={inputDef} onChange={e=>setInputDef(e.target.value)} className="w-full bg-gray-50 rounded-xl px-4 py-3 border-none focus:ring-2 focus:ring-gray-900" placeholder="예: 사과" onKeyDown={e=>e.key==='Enter'&&addWord()} />
+                    </div>
+                    <button onClick={addWord} className="w-full bg-gray-900 text-white rounded-xl py-3 font-semibold hover:bg-black transition-colors">추가하기</button>
                   </div>
                 </div>
 
-                <div className="rounded-2xl bg-white border border-gray-200 p-4 shadow-sm">
-                  <h3 className="text-sm font-semibold">대량 추가 (한 줄당 "일본어,한글")</h3>
-                  <textarea ref={bulkRef} rows={5} className="mt-2 w-full rounded-xl border border-gray-300 px-3 py-3" placeholder={"食べる,먹다\n美しい,아름답다"} />
-                  <div className="mt-2 flex gap-2">
-                    <button onClick={addBulk} className="rounded-xl bg-white border border-gray-300 px-4 py-2">추가</button>
-                    <button onClick={()=>{
-                      const csv = words.map(w=>`${w.jp},${w.ko}`).join("\n");
-                      navigator.clipboard.writeText(csv);
-                      alert("CSV 형식으로 클립보드에 복사되었습니다.");
-                    }} className="rounded-xl bg-white border border-gray-300 px-4 py-2">내보내기(클립보드)</button>
-                    <button onClick={()=>{
-                      const raw = prompt("붙여넣을 CSV 텍스트(일본어,한글)...");
-                      if (!raw) return;
-                      const lines = raw.split(/\n+/).map(l=>l.trim()).filter(Boolean);
-                      const newItems = lines.map((line)=>{
-                        const [j,k] = line.split(/[,\t|]/);
-                        return { id: uid(), jp: (j||"").trim(), ko: (k||"").trim(), addedAt: Date.now(), timesSeen:0, timesKnown:0, timesUnknown:0, lastSeen:null, streakKnown:0 };
-                      }).filter(w=>w.jp && w.ko);
-                      if (newItems.length) setWords(prev=>[...newItems, ...prev]);
-                    }} className="rounded-xl bg-white border border-gray-300 px-4 py-2">가져오기(텍스트)</button>
-                  </div>
+                <div className="bg-white p-5 rounded-3xl border border-gray-200 shadow-sm">
+                   <h3 className="font-bold text-sm text-gray-500 mb-2">대량 추가 (줄바꿈으로 구분)</h3>
+                   <textarea ref={bulkRef} className="w-full h-24 bg-gray-50 rounded-xl p-3 text-sm border-none mb-2" placeholder={`${termLabel},뜻\n${termLabel},뜻...`}></textarea>
+                   <button onClick={addBulk} className="px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm font-medium">한꺼번에 추가</button>
                 </div>
 
-                <div className="rounded-2xl bg-white border border-gray-200 p-4 shadow-sm">
-                  <h3 className="text-sm font-semibold">단어 목록 ({words.length}개)</h3>
-                  {words.length===0 ? (
-                    <p className="mt-2 text-sm text-gray-600">등록된 단어가 없습니다.</p>
-                  ) : (
-                    <ul className="mt-2 divide-y divide-gray-100">
-                      {words.map((w)=>{
-                        const seen = w.timesSeen || 0;
-                        const acc = seen ? Math.round((w.timesKnown/seen)*100) : 0;
-                        return (
-                          <li key={w.id} className="py-3 flex items-center justify-between gap-3">
-                            <div>
-                              <div className="text-sm font-medium flex items-center gap-2">
-                                <span>{w.jp}</span>
-                                <button className="text-xs px-2 py-1 rounded-full border border-gray-300 bg-white icon-btn" title="발음 듣기" onClick={() => speakJa(w.jp)}>🔊</button>
-                                <span className="text-gray-500">— {w.ko}</span>
-                              </div>
-                              <div className="text-xs text-gray-500">학습 {seen} · 정답률 {acc}%</div>
-                            </div>
-                            <button onClick={()=>removeWord(w.id)} className="text-xs px-3 py-1 rounded-full border border-gray-300">삭제</button>
-                          </li>
-                        )
-                      })}
-                    </ul>
-                  )}
+                <div className="pb-10">
+                  <h3 className="font-bold text-lg ml-2 mb-3">단어 목록 ({words.length})</h3>
+                  <div className="space-y-2">
+                    {words.map(w => (
+                      <div key={w.id} className="group bg-white rounded-xl p-4 border border-gray-100 flex items-center justify-between hover:border-gray-300 transition-colors">
+                        <div className="flex-1">
+                          <div className="font-bold text-lg flex items-center gap-2">
+                            {w.term}
+                            <button onClick={()=>speak(w.term, activeDeck.lang)} className="text-gray-300 hover:text-gray-600">🔊</button>
+                          </div>
+                          <div className="text-gray-600">{w.def}</div>
+                        </div>
+                        <button onClick={()=>setWords(prev=>prev.filter(x=>x.id!==w.id))} className="text-gray-300 hover:text-red-500 p-2">
+                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </section>
             )}
 
+            {/* --- TAB: STATS --- */}
             {tab === "stats" && (
-              <section className="space-y-4">
-                <div className="rounded-2xl bg-white border border-gray-200 p-4 shadow-sm">
-                  <h2 className="text-base font-semibold">전체 통계</h2>
-                  <div className="mt-2 grid grid-cols-2 gap-3 text-sm">
-                    <Stat label="누적 세트" value={stats.sessions} />
-                    <Stat label="누적 카드" value={stats.reviews} />
-                    <Stat label="누적 정답" value={stats.correct} />
-                    <Stat label="누적 오답" value={stats.incorrect} />
-                  </div>
-                  <div className="mt-3 text-sm">전체 정답률: <span className="font-semibold">{accuracyTotal}%</span></div>
-                </div>
+              <section className="space-y-4 fade-in">
+                 <div className="grid grid-cols-2 gap-3">
+                    <div className="bg-white p-4 rounded-2xl border border-gray-200 text-center">
+                      <div className="text-xs text-gray-400 font-bold uppercase">Total Reviews</div>
+                      <div className="text-2xl font-black text-gray-900">{stats.reviews}</div>
+                    </div>
+                    <div className="bg-white p-4 rounded-2xl border border-gray-200 text-center">
+                      <div className="text-xs text-gray-400 font-bold uppercase">Accuracy</div>
+                      <div className="text-2xl font-black text-green-600">{accuracyTotal}%</div>
+                    </div>
+                 </div>
 
-                <div className="rounded-2xl bg-white border border-gray-200 p-4 shadow-sm">
-                  <h3 className="text-sm font-semibold">모드별 정답률</h3>
-                  <div className="mt-2 grid grid-cols-2 gap-3 text-sm">
-                    <Stat label="🇯🇵→🇰🇷" value={`${accuracyJa2Ko}%`} />
-                    <Stat label="🇰🇷→🇯🇵" value={`${accuracyKo2Ja}%`} />
-                  </div>
-                </div>
-
-                <div className="rounded-2xl bg-white border border-gray-200 p-4 shadow-sm">
-                  <h3 className="text-sm font-semibold">세트 기록</h3>
-                  {logs.length === 0 ? (
-                    <p className="mt-2 text-sm text-gray-600">기록이 없습니다.</p>
-                  ) : (
-                    <ul className="mt-2 space-y-2 text-sm">
-                      {[...logs].slice(-50).reverse().map((g) => {
-                        const d = new Date(g.ts);
-                        const label = `${d.getFullYear()}.${String(d.getMonth()+1).padStart(2,'0')}.${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
-                        const rate = g.total ? Math.round(g.correct / g.total * 100) : 0;
-                        return (
-                          <li key={g.id} className="rounded-xl border border-gray-200 p-3">
-                            <div className="flex items-center justify_between">
-                              <div className="font-medium">{g.mode==="ja2ko"?"🇯🇵→🇰🇷":"🇰🇷→🇯🇵"} · {label}</div>
-                              <div className="text-sm">{rate}% ({g.correct}/{g.total})</div>
-                            </div>
-                          </li>
-                        );
-                      })}
-                    </ul>
-                  )}
-                </div>
+                 <div className="bg-white p-5 rounded-3xl border border-gray-200">
+                    <h3 className="font-bold text-lg mb-4">최근 학습 기록</h3>
+                    {logs.length === 0 ? <div className="text-center text-gray-400 py-4">기록이 없습니다.</div> : (
+                      <div className="space-y-3">
+                         {[...logs].reverse().slice(0, 20).map(l => (
+                           <div key={l.id} className="flex items-center justify-between text-sm p-2 border-b border-gray-50 last:border-0">
+                             <div className="flex flex-col">
+                               <span className="font-medium text-gray-700">{new Date(l.ts).toLocaleDateString()}</span>
+                               <span className="text-xs text-gray-400">{l.mode==='term2def' ? `${termLabel}→뜻` : `뜻→${termLabel}`}</span>
+                             </div>
+                             <div className="font-bold">
+                               {Math.round(l.correct/l.total*100)}% <span className="text-gray-400 text-xs font-normal">({l.correct}/{l.total})</span>
+                             </div>
+                           </div>
+                         ))}
+                      </div>
+                    )}
+                 </div>
               </section>
             )}
 
+            {/* --- TAB: SETTINGS --- */}
             {tab === "settings" && (
-              <section className="space-y-4">
-                <div className="rounded-2xl bg-white border border-gray-200 p-4 shadow-sm">
-                  <h2 className="text-base font-semibold">클라우드 동기화 (GitHub Gist)</h2>
-                  <p className="text-sm text-gray-600 mt-1">
-                    - 개인 액세스 토큰(PAT)은 <b>gist</b> 권한만 주는 것을 권장합니다. 이 토큰은 이 기기의 LocalStorage에만 저장됩니다.<br/>
-                    - 새 기기에서 동일한 <b>Gist ID</b>와 토큰을 입력한 뒤 "불러오기" 하면 단어/통계/기록을 모두 가져옵니다.
-                  </p>
-                  <div className="mt-3 grid gap-2 text-sm">
-                    <label className="grid gap-1">
-                      <span className="text-gray-600">GitHub Personal Access Token (gist scope)</span>
-                      <input type="password" value={config.gistToken||""} onChange={e=>setConfig(prev=>({...prev, gistToken:e.target.value}))} className="w-full rounded-xl border border-gray-300 px-3 py-2" placeholder="ghp_..." />
-                    </label>
-                    <label className="grid gap-1">
-                      <span className="text-gray-600">Gist ID</span>
-                      <input value={config.gistId||""} onChange={e=>setConfig(prev=>({...prev, gistId:e.target.value}))} className="w-full rounded-xl border border-gray-300 px-3 py-2" placeholder="예: a1b2c3d4..." />
-                    </label>
-                    <label className="grid gap-1">
-                      <span className="text-gray-600">파일명</span>
-                      <input value={config.filename||"vocab_data.json"} onChange={e=>setConfig(prev=>({...prev, filename:e.target.value||"vocab_data.json"}))} className="w-full rounded-xl border border-gray-300 px-3 py-2" />
-                    </label>
-                    <div className="flex items-center gap-2 mt-1">
-                      <input id="autosync" type="checkbox" checked={!!config.autoSync} onChange={e=>setConfig(prev=>({...prev, autoSync:e.target.checked}))} />
-                      <label htmlFor="autosync" className="text-gray-700">자동 동기화(단어/통계/기록을 Gist에 자동 저장)</label>
+              <section className="space-y-6 fade-in pb-20">
+                {/* 1. Deck Management */}
+                <div className="bg-white rounded-3xl border border-gray-200 p-5 shadow-sm">
+                  <h2 className="font-bold text-lg mb-4">📚 단어장 관리</h2>
+                  
+                  {/* Create New */}
+                  <div className="bg-gray-50 rounded-xl p-4 mb-4">
+                    <h3 className="text-sm font-semibold mb-2">새 단어장 만들기</h3>
+                    <div className="space-y-2">
+                       <input id="newDeckName" className="w-full px-3 py-2 rounded-lg border border-gray-200 text-sm" placeholder="단어장 이름 (예: TOEIC 필수)" />
+                       <div className="flex gap-2">
+                         <select id="newDeckLang" className="flex-1 px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white">
+                           <option value="ja">🇯🇵 일본어</option>
+                           <option value="en">🇺🇸 영어</option>
+                         </select>
+                         <button onClick={()=>{
+                            const name = document.getElementById("newDeckName").value;
+                            const lang = document.getElementById("newDeckLang").value;
+                            if(name) { createDeck(name, lang); document.getElementById("newDeckName").value=""; }
+                         }} className="bg-gray-900 text-white px-4 py-2 rounded-lg text-sm font-semibold">생성</button>
+                       </div>
                     </div>
                   </div>
-                  <div className="mt-3 flex gap-2">
-                    <button onClick={createNewGist} className="rounded-xl bg-white border border-gray-300 px-4 py-2">새 Gist 생성</button>
-                    <button onClick={saveToGist} className="rounded-xl bg-white border border-gray-300 px-4 py-2">지금 저장</button>
-                    <button onClick={loadFromGist} className="rounded-xl bg-white border border-gray-300 px-4 py-2">불러오기</button>
+
+                  {/* List */}
+                  <div className="space-y-2">
+                    {decks.map(d => (
+                      <div key={d.id} className={`flex items-center justify-between p-3 rounded-xl border ${activeDeckId===d.id ? 'border-gray-900 bg-gray-50 ring-1 ring-gray-900' : 'border-gray-100'}`}>
+                        <div onClick={()=>setActiveDeckId(d.id)} className="flex-1 cursor-pointer">
+                          <div className="font-bold text-sm">{d.name} {activeDeckId===d.id && <span className="text-xs text-blue-600 bg-blue-50 px-1 rounded ml-1">현재 사용중</span>}</div>
+                          <div className="text-xs text-gray-500">{getLangLabel(d.lang)}</div>
+                        </div>
+                        {decks.length > 1 && (
+                          <button onClick={()=>deleteDeck(d.id)} className="text-xs text-red-400 hover:text-red-600 px-2 py-1">삭제</button>
+                        )}
+                      </div>
+                    ))}
                   </div>
                 </div>
 
-                <div className="rounded-2xl bg-white border border-gray-200 p-4 shadow-sm">
-                  <h3 className="text-sm font-semibold">백업/복원 (파일)</h3>
-                  <div className="mt-2 flex gap-2">
-                    <button onClick={()=>{
-                      const payload = { words, stats, logs };
-                      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-                      const url = URL.createObjectURL(blob);
-                      const a = document.createElement('a');
-                      a.href = url;
-                      a.download = `vocab_backup_${new Date().toISOString().slice(0,10)}.json`;
-                      a.click();
-                      URL.revokeObjectURL(url);
-                    }} className="rounded-xl bg-white border border-gray-300 px-4 py-2">백업 다운로드</button>
-                    <button onClick={()=>{
-                      const input = document.createElement('input');
-                      input.type = 'file';
-                      input.accept = 'application/json';
-                      input.onchange = () => {
-                        const file = input.files && input.files[0];
-                        if (!file) return;
-                        const reader = new FileReader();
-                        reader.onload = () => {
-                          try {
-                            const data = JSON.parse(String(reader.result || '{}'));
-                            if (data.words && Array.isArray(data.words)) setWords(data.words);
-                            if (data.stats) setStats(data.stats);
-                            if (Array.isArray(data.logs)) setLogs(data.logs);
-                            alert('복원 완료');
-                          } catch (err) {
-                            alert('복원 실패: 파일 형식 오류');
-                          }
-                        };
-                        reader.readAsText(file);
-                      };
-                      input.click();
-                    }} className="rounded-xl bg-white border border-gray-300 px-4 py-2">백업 복원</button>
+                {/* 2. Cloud Sync */}
+                <div className="bg-white rounded-3xl border border-gray-200 p-5 shadow-sm">
+                  <h2 className="font-bold text-lg mb-2">☁️ 클라우드 동기화 (Gist)</h2>
+                  <p className="text-xs text-gray-500 mb-4">GitHub Gist를 사용하여 모든 단어장을 백업하고 기기 간 동기화합니다.</p>
+                  
+                  <div className="space-y-3 mb-4">
+                    <input type="password" value={config.gistToken||""} onChange={e=>setConfig(p=>({...p, gistToken:e.target.value}))} className="w-full px-3 py-2 rounded-lg border border-gray-200 text-sm" placeholder="GitHub Token (gist scope)" />
+                    <input value={config.gistId||""} onChange={e=>setConfig(p=>({...p, gistId:e.target.value}))} className="w-full px-3 py-2 rounded-lg border border-gray-200 text-sm" placeholder="Gist ID (Optional for new)" />
+                    <div className="flex items-center gap-2">
+                      <input id="as" type="checkbox" checked={config.autoSync} onChange={e=>setConfig(p=>({...p, autoSync:e.target.checked}))} />
+                      <label htmlFor="as" className="text-sm text-gray-700">변경사항 자동 저장</label>
+                    </div>
+                  </div>
+                  
+                  <div className="flex gap-2">
+                    <button onClick={saveToGist} className="flex-1 bg-gray-900 text-white py-2 rounded-lg text-sm font-semibold">지금 백업</button>
+                    <button onClick={loadFromGist} className="flex-1 bg-white border border-gray-300 py-2 rounded-lg text-sm font-semibold">불러오기</button>
                   </div>
                 </div>
               </section>
             )}
+
           </main>
-
-          <footer className="fixed bottom-0 left-0 right-0 mx-auto max-w-md px-4 py-3 bg-gradient-to-t from-white to-white/70 border-t border-gray-200">
-            <div className="text-center text-[11px] text-gray-500">학습 데이터는 LocalStorage에 저장되며, 설정에서 Gist 동기화를 켜면 단어/정답률/세트 기록이 JSON으로 동기화됩니다.</div>
-          </footer>
-        </div>
-      );
-    }
-
-    function Stat({ label, value }) {
-      return (
-        <div className="rounded-xl bg-gray-50 border border-gray-200 px-3 py-3 text-center">
-          <div className="text-xs text-gray-500">{label}</div>
-          <div className="text-lg font-bold">{value}</div>
         </div>
       );
     }
